@@ -1,0 +1,3 @@
+model_path_rlanes: "agent/models/road_lane_yolo11/YOLO11n/weights/best.pt"
+model_path_panels: "agent/models/pavement_panel_yolo11/YOLO11n/weights/best.pt"
+model_path_classifier: "agent/models/vit_classifier"
