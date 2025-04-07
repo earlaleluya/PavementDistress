@@ -16,11 +16,12 @@ class YOLOPredictor:
         >>> print(results)
     """
 
-    def __init__(self, model_path):
+    def __init__(self, model_path, device=None):
         """
         Initializes the YOLOPredictor with the specified model path and sets up the device.
         """
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model = YOLO(model_path)
         self.model.to(device)
 

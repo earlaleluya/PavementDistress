@@ -1,30 +1,237 @@
 import torch
 import numpy as np 
+import cv2
 from math import sqrt
+from agent.engine.predictions import Prediction
+from ultralytics.engine.results import Results
+import json 
+from pathlib import Path
+
 
 
 
 class Filler:
-    def __init__(self, pred_rlanes, pred_panels):
+    """
+    The `Filler` class is responsible for processing and filling missing panels in road lane 
+    and panel prediction data. It provides methods to sort, group, and resolve missing panels 
+    by leveraging geometric relationships between road lanes and panels.
+    
+    Attributes:
+        pred_rlanes (object): The predicted road lane data, containing masks and other attributes.
+        pred_panels (object): The predicted panel data, containing masks and other attributes.
+        image (numpy.ndarray): A copy of the original image associated with the predictions.
+        args (Namespace): A namespace object containing configuration arguments.
+        device (torch.device): The device (CPU or GPU) used for tensor computations.
+    
+    Example:
+        # Assuming `pred_rlanes`, `pred_panels`, and `args` are already defined
+        >>> filler = Filler(pred_rlanes, pred_panels, args)
+        >>> prediction = filler.fill()
+        >>> print(prediction)
+        >>> prediction.show()
+    """
+
+
+    def __init__(self, pred_rlanes, pred_panels, args):
         self.pred_rlanes = pred_rlanes
         self.pred_panels = pred_panels
         self.image = pred_rlanes.orig_img.copy()
-
+        self.args = args
+        self.device = torch.device(args.device)
+        
 
 
     def fill(self):
+        """
+        Fills missing panels in the prediction data by processing road lane and panel polygons.
+
+        This method performs the following steps:
+        1. Sorts the predicted road lane and panel polygons.
+        2. Extracts road lane curves from the sorted road lane polygons.
+        3. Groups the panel polygons by their corresponding road lane curves.
+        4. Resolves missing panels within the grouped panel polygons.
+        5. Creates a result object containing the filled panel polygons and road lane polygons.
+
+        Returns:
+            Prediction (`Results` object): An object containing the original road lane and panel predictions,
+                                           along with the filled panel predictions.
+        """
         polygons_rlanes = self.get_sort_polygons(self.pred_rlanes)
         polygons_panels = self.get_sort_polygons(self.pred_panels)
         lane_curves = self.get_road_lane_curves(polygons_rlanes)
-        grouped_polygons_panels = self.group_by_curves(polygons_panels, lane_curves)
+        grouped_polygons_panels = self.group_by_curves(polygons_panels, lane_curves)      
+        # grouped_polygons_panels = self.debug_test(grouped_polygons_panels) # TODO remove
         filled_polygons_panels = self.resolve_missing_panels(grouped_polygons_panels)
-        print(filled_polygons_panels.shape)
+        result_filled_panels = self.create_panels_result_obj(filled_polygons_panels, polygons_rlanes)
+        prediction = Prediction(
+            result_lanes=self.pred_rlanes, 
+            result_panels=self.pred_panels,
+            result_filled_panels=result_filled_panels,
+            device=self.device
+        )
+        return prediction
 
 
 
+    def create_panels_result_obj(self, filled_polygons_panels, polygons_rlanes):
+        """
+        Creates a `Results` object for the filled panels using the provided polygons.
 
-    def restructure_result(self):
-        pass 
+        Args:
+            filled_polygons_panels (numpy.ndarray): A 4D array of shape 
+                (n_lanes, max_n_panels, 4, 2) representing the polygons for each panel.
+            polygons_rlanes (list of numpy.ndarray): A list of polygons representing 
+                road lanes.
+
+        Returns:
+            Results: A `Results` object containing the updated boxes and masks data.
+        """
+        filled_panels = Results(
+            orig_img=self.pred_panels.orig_img,
+            path=self.pred_panels.path,
+            names=self.get_classifier_id2label(),
+        )
+        masks_data = self.create_masks_data(filled_polygons_panels, polygons_rlanes)
+        filled_panels.update(masks=masks_data)
+        boxes_data = self.create_boxes_data(filled_panels.masks.xy)
+        filled_panels.update(boxes_data)
+        return filled_panels
+
+
+
+    def get_classifier_id2label(self):
+        """
+        Retrieves the mapping of classifier IDs to labels from the configuration file.
+
+        Returns:
+            dict: A dictionary where keys are classifier IDs (as strings) and values are
+            their corresponding labels.
+
+        Raises:
+            FileNotFoundError: If the configuration file does not exist.
+            json.JSONDecodeError: If the configuration file is not a valid JSON.
+            KeyError: If the 'id2label' key is missing in the configuration file.
+        """
+        vit_cfg_file = Path(self.args.model_path_classifier) / 'config.json'
+        with open(vit_cfg_file, 'r') as f:
+            vit_cfg = json.load(f)
+        return {int(k): v for k, v in vit_cfg['id2label'].items()}
+        
+
+
+    def create_boxes_data(self, masks_xy):
+        """
+        Generates a tensor containing bounding box data for a given list of masks.
+
+        Args:
+            masks_xy (list of torch.Tensor): A list of tensors where each tensor represents 
+                the coordinates of a mask. The list contains `n_lanes * max_n_panels` number of masks.
+
+        Returns:
+            torch.Tensor: A tensor of shape (len(masks_xy), 6) where each row contains the bounding 
+                box data for a corresponding mask. The first four columns represent the bounding box 
+                coordinates, and the remaining columns (for conf, cls, respectively) are initialized to zero.
+        """
+        boxes_data = torch.zeros((len(masks_xy), 6), device=self.device, dtype=torch.float32)
+        for i, mask_xy in enumerate(masks_xy):
+            box = torch.from_numpy(np.array(self.polygon2box(mask_xy))).to(device=self.device, dtype=torch.float32)
+            box_data = box.view(1, 4)
+            boxes_data[i, 0:4] = box_data
+        return boxes_data
+        
+
+
+
+    def create_masks_data(self, filled_polygons_panels, polygons_rlanes): 
+        """
+        Creates mask data for filled polygons and road lanes.
+
+        Args:
+            filled_polygons_panels (numpy.ndarray): A 4D array of shape 
+                (n_lanes, max_n_panels, n_points, n_coords) representing the 
+                polygons for each panel.
+            polygons_rlanes (list of numpy.ndarray): A list of polygons representing 
+                road lanes.
+
+        Returns:
+            torch.Tensor: A 3D tensor of shape (n_lanes * max_n_panels, img_height, img_width) 
+                containing the mask data for each panel.
+        """
+        img_height, img_width = self.pred_rlanes.orig_shape   
+        n_lanes, max_n_panels, n_points, n_coords = filled_polygons_panels.shape        
+        masks_data = torch.zeros((n_lanes * max_n_panels, img_height, img_width), device=self.device, dtype=torch.float32)
+        # Loop for each panel
+        reshaped_polygons = filled_polygons_panels.reshape(n_lanes * max_n_panels, n_points, n_coords)
+        for i, polygon in enumerate(reshaped_polygons):
+            # Create mask for road lane
+            mask_rlane = np.zeros((img_height, img_width), dtype=np.uint8)
+            polygon_rlane = polygons_rlanes[i // max_n_panels]
+            mask_rlane = cv2.fillPoly(mask_rlane, [polygon_rlane], 255)            
+            # Create mask for panel
+            mask_panel = np.zeros((img_height, img_width), dtype=np.uint8)
+            box = np.array(self.polygon2box(polygon)).reshape(-1) 
+            x_min, y_min, x_max, y_max = np.round(box).astype(np.int32)
+            box_width = (x_max - x_min)
+            x1, x2 = max(0, x_min - box_width), max(img_width, x_max + box_width)
+            mask_panel = cv2.rectangle(mask_panel, (x1, y_min), (x2, y_max), 255, thickness=-1)                 
+            # Combine masks by intersection
+            mask = cv2.bitwise_and(mask_rlane, mask_panel)        
+            mask_data = mask.astype(np.float32)  / 255.0
+            masks_data[i] = torch.from_numpy(mask_data).to(device=self.device, dtype=torch.float32)        
+        return masks_data
+    
+         
+
+
+
+    def debug_test(self, panels):
+        """
+        Filters out specific panel indices from a 2D array of panels and returns a ragged array.
+
+        Args:
+            panels (numpy.ndarray): A 2D array representing panels, where the shape is (n_lanes, n_panels).
+
+        Returns:
+            list: A ragged array (list of numpy arrays) where each sub-array corresponds to a lane
+                  with specific panel indices removed. The sub-arrays are of dtype `object`.
+
+        Notes:
+            The indices to be removed are hardcoded as:
+            [(2, 4), (3, 4), (4, 4), (3, 3), (3, 5)].
+        """
+        indices_to_remove = [(2,4), (3,4),(4,4),(3,3), (3,5)]
+        ragged_array = []
+        n_lanes, n_panels = panels.shape[:2]  
+        for i in range(n_lanes):
+            lane_panels = []
+            for j in range(n_panels):
+                if (i, j) not in indices_to_remove:
+                    lane_panels.append(panels[i, j])
+            ragged_array.append(np.array(lane_panels, dtype=object)) 
+        return ragged_array
+
+
+
+    def debug_show(self, panels):
+        """
+        Visualizes the given panels by overlaying them on the image and displaying the result.
+
+        This method takes a set of panels, reshapes them into polygons, and fills them with green color
+        on a copy of the image. Each frame is displayed one at a time, and the user can press any key 
+        to proceed to the next frame.
+
+        Args:
+            panels (numpy.ndarray): A numpy array of shape (N, 8) representing the coordinates of the 
+                                    panels. Each panel is expected to have 4 points (x, y) flattened 
+                                    into a single array.
+        """
+        canvas = self.image.copy()
+        reshaped_polygons = panels.reshape(-1, 4, 2)
+        for poly in reshaped_polygons:
+            cv2.fillPoly(canvas, [poly], (0,255,0))
+            cv2.imshow("frame", canvas)
+            cv2.waitKey(0)
+        cv2.destroyAllWindows()
 
 
 
@@ -57,12 +264,15 @@ class Filler:
             else:   # Insert empty polygons for all missing panels at their appropriate positions
                 result_panels[i] = self.insert_empty_polygons(panels_with_missing[i], panels_with_missing[ref_idx])
         # Fill missing panels based on the neighbors' coordinates
-        result_panels = self.fill_missing_panels(result_panels)
+        result_panels, force_resolve = self.fill_missing_panels(result_panels)
+        if force_resolve:
+            result_panels, force_resolve = self.fill_missing_panels(result_panels, force_resolve)
         return result_panels
 
 
 
-    def fill_missing_panels(self, panels):
+    # TODO update docstring
+    def fill_missing_panels(self, panels, force_resolve=False):
         """
         Fills missing panels in a 4D numpy array based on the coordinates of 
         neighboring panels.
@@ -102,28 +312,70 @@ class Filler:
                 return not np.all(panels[i + 1, j] == 0)
             return False
         rows, cols, _, _ = panels.shape
+        non_empty = True
         for i in range(rows):
             for j in range(cols):
                 if np.all(panels[i, j] == 0):  # Check if the entire panel is missing (all zeros)
-                    selected_points = []
+                    non_empty = False
+                    top_left_points = []
+                    bot_left_points = []
+                    bot_right_points = []
+                    top_right_points = []
                     # Check neighbors and add specific points accordingly
                     if is_valid_top_neighbor(panels, i, j, rows, cols): 
-                        selected_points.append(panels[i, j - 1][[1, 2]]) # Bottom left and bottom right
+                        top_left_points.append(panels[i, j - 1][1])     # top neighbor's bottom left 
+                        top_right_points.append(panels[i, j - 1][2])    # top neighbor's bottom right
                     if is_valid_bottom_neighbor(panels, i, j, rows, cols):  
-                        selected_points.append(panels[i, j + 1][[0, 3]]) # Top left and top right
-                    if is_valid_left_neighbor(panels, i, j, rows, cols): 
-                        selected_points.append(panels[i - 1, j][[2, 3]]) # Bottom right and top right
+                        bot_left_points.append(panels[i, j + 1][0])     # bottom neighbor's top left
+                        bot_right_points.append(panels[i, j + 1][3])    # bottom neighbor's top right
+                    if is_valid_left_neighbor(panels, i, j, rows, cols):
+                        bot_left_points.append(panels[i - 1, j][2])    # left neighbor's bottom right
+                        top_left_points.append(panels[i - 1, j][3])    # left neighbor's top right
                     if is_valid_right_neighbor(panels, i, j, rows, cols):  # Right neighbor
-                        selected_points.append(panels[i + 1, j][[0, 1]]) # Top left and bottom left
-                    # Select only one entry if multiple points were added on each side
-                    if selected_points:
-                        selected_points = np.vstack(selected_points)
-                        x_coords = selected_points[:, 0]
-                        y_coords = selected_points[:, 1]
-                        x_min, y_min = np.min(x_coords), np.min(y_coords)
-                        x_max, y_max = np.max(x_coords), np.max(y_coords)
-                        panels[i, j] = np.array([[x_min, y_min], [x_min, y_max], [x_max, y_max], [x_max, y_min]])
-        return panels
+                        top_right_points.append(panels[i + 1, j][0])     # right neighbor's top left
+                        bot_right_points.append(panels[i + 1, j][1])     # right neighbor's bottom left
+                    # Get the point from top_left_points where it has the minimum x-coordinate and y-coordinate
+                    if top_left_points:
+                        top_left_points = np.array(top_left_points)
+                        x_min = np.min(top_left_points[:, 0])  
+                        y_min = np.min(top_left_points[:, 1])  
+                        top_left_points = np.array([[x_min, y_min]])
+                    # Get the point from bot_left_points where it has the minimum x-coordinate and maximum y-coordinate
+                    if bot_left_points:
+                        bot_left_points = np.array(bot_left_points)
+                        x_min = np.min(bot_left_points[:, 0])  
+                        y_max = np.max(bot_left_points[:, 1])  
+                        bot_left_points = np.array([[x_min, y_max]])
+                    # Get the point from bot_right_points where it has the maximum x-coordinate and maximum y-coordinate
+                    if bot_right_points:    
+                        bot_right_points = np.array(bot_right_points)   
+                        x_max = np.max(bot_right_points[:, 0])  
+                        y_max = np.max(bot_right_points[:, 1])  
+                        bot_right_points = np.array([[x_max, y_max]])
+                    # Get the point from top_right_points where it has the maximum x-coordinate and minimum y-coordinate    
+                    if top_right_points:
+                        top_right_points = np.array(top_right_points)
+                        x_max = np.max(top_right_points[:, 0])  
+                        y_min = np.min(top_right_points[:, 1])  
+                        top_right_points = np.array([[x_max, y_min]])
+                    # Concatenate the points to form the polygon
+                    if len(top_left_points) == 1 and len(bot_left_points) == 1 and len(bot_right_points) == 1 and len(top_right_points) == 1:
+                        panels[i, j] = np.vstack([top_left_points, bot_left_points, bot_right_points, top_right_points])
+                    elif force_resolve:
+                        # TODO debug this part: @debug_test(), set indices_to_remove = [(2,4), (3,4),(4,4),(3,3), (3,5), (0,7), (2,5)] 
+                        valid_points = [arr for arr in [top_left_points, bot_left_points, bot_right_points, top_right_points] if len(arr) > 0]
+                        if valid_points:  # Ensure there are valid points
+                            points = np.vstack(valid_points)
+                            [[x_min, y_min], [y_min, y_max]] = self.polygon2box(points)
+                            panels[i, j] = np.array([[x_min, y_min], [x_min, y_max], [x_max, y_max], [x_max, y_min]])
+        # Do recursion if missing panels are found in between     
+        if non_empty:
+            return panels, False
+        else:
+            try:
+                return self.fill_missing_panels(panels)
+            except RecursionError:
+                return panels, True
 
 
 
